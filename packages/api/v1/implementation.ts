@@ -5,8 +5,9 @@ import { DATE_FORMATS, DEFAULT_DOCUMENT_DATE_FORMAT } from '@documenso/lib/const
 import {
   DocumentDataType,
   EnvelopeType,
+  FieldType,
   type ReadStatus,
-  type RecipientRole,
+  RecipientRole,
   type SendStatus,
   SigningStatus,
 } from '@prisma/client';
@@ -575,6 +576,57 @@ export const ApiContractV1Implementation = tsr.router(ApiContractV1, {
           recipients: body.recipients,
           requestMetadata: metadata,
         });
+
+        const envelopeWithRecipients = await prisma.envelope.findFirstOrThrow({
+          where: {
+            id: envelope.id,
+          },
+          include: {
+            envelopeItems: {
+              orderBy: {
+                order: 'asc',
+              },
+            },
+            recipients: {
+              orderBy: {
+                id: 'asc',
+              },
+            },
+          },
+        });
+
+        const firstEnvelopeItem = envelopeWithRecipients.envelopeItems[0];
+
+        if (!firstEnvelopeItem) {
+          return {
+            status: 400,
+            body: {
+              message: 'Document is missing an envelope item.',
+            },
+          };
+        }
+
+        const signerRecipients = envelopeWithRecipients.recipients.filter(
+          (recipient) => recipient.role === RecipientRole.SIGNER,
+        );
+
+        if (signerRecipients.length > 0) {
+          await prisma.field.createMany({
+            data: signerRecipients.map((recipient, index) => ({
+              envelopeId: envelope.id,
+              envelopeItemId: firstEnvelopeItem.id,
+              recipientId: recipient.id,
+              type: FieldType.SIGNATURE,
+              page: 1,
+              positionX: 10,
+              positionY: Math.min(84, 72 + index * 9),
+              width: 35,
+              height: 8,
+              customText: '',
+              inserted: false,
+            })),
+          });
+        }
 
         const createdDocument = await prisma.envelope.findFirstOrThrow({
           where: {

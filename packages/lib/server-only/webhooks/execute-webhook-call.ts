@@ -36,7 +36,7 @@ const parseBody = (text: string): Prisma.InputJsonValue => {
 
 const shouldUseAnchorAgreementsPayload = (url: string) => {
   try {
-    return new URL(url).pathname.endsWith(ANCHOR_AGREEMENTS_WEBHOOK_PATH);
+    return new URL(url).pathname.replace(/\/+$/, '').endsWith(ANCHOR_AGREEMENTS_WEBHOOK_PATH);
   } catch {
     return false;
   }
