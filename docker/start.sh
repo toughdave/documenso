@@ -13,6 +13,7 @@ if [ -f "$CERT_PATH" ] && [ -r "$CERT_PATH" ]; then
 else
     printf "⚠️ Certificate not found or not readable\n"
     printf "💡 Tip: Documenso will still start, but document signing will be unavailable\n"
+    printf "🔧 The production image runs as uid=1001 gid=65533; make the mounted cert readable by that user\n"
     printf "🔧 Check: http://localhost:3000/api/certificate-status for detailed status\n"
 fi
 
