@@ -1242,7 +1242,7 @@ export const ApiContractV1Implementation = tsr.router(ApiContractV1, {
 
   sendDocument: authenticatedMiddleware(async (args, user, team, { logger, metadata }) => {
     const { id: documentId } = args.params;
-    const { sendEmail, sendCompletionEmails } = args.body;
+    const { sendEmail, sendCompletionEmails } = args.body ?? {};
 
     logger.info({
       input: {
