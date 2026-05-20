@@ -38,6 +38,7 @@ import {
   ZUnsuccessfulResponseSchema,
   ZUpdateFieldMutationSchema,
   ZUpdateRecipientMutationSchema,
+  ZVoidDocumentMutationSchema,
 } from './schema';
 
 const c = initContract();
@@ -229,6 +230,22 @@ export const ApiContractV1 = c.router(
         404: ZUnsuccessfulResponseSchema,
       },
       summary: 'Delete a document',
+      deprecated: true,
+      description: deprecatedDescription,
+    },
+
+    voidDocument: {
+      method: 'POST',
+      path: '/api/v1/documents/:id/void',
+      body: ZVoidDocumentMutationSchema,
+      responses: {
+        200: ZSuccessfulDocumentResponseSchema,
+        400: ZUnsuccessfulResponseSchema,
+        401: ZUnsuccessfulResponseSchema,
+        404: ZUnsuccessfulResponseSchema,
+        500: ZUnsuccessfulResponseSchema,
+      },
+      summary: 'Void or cancel a pending document',
       deprecated: true,
       description: deprecatedDescription,
     },

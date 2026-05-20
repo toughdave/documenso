@@ -36,6 +36,7 @@ export const ZGetDocumentsQuerySchema = z.object({
   page: z.coerce.number().min(1).optional().default(1),
   perPage: z.coerce.number().min(1).optional().default(10),
   folderId: z.string().describe('Filter documents by folder ID. When omitted, returns root documents.').optional(),
+  status: z.string().optional(),
 });
 
 export type TGetDocumentsQuerySchema = z.infer<typeof ZGetDocumentsQuerySchema>;
@@ -43,6 +44,14 @@ export type TGetDocumentsQuerySchema = z.infer<typeof ZGetDocumentsQuerySchema>;
 export const ZDeleteDocumentMutationSchema = null;
 
 export type TDeleteDocumentMutationSchema = typeof ZDeleteDocumentMutationSchema;
+
+export const ZVoidDocumentMutationSchema = z
+  .object({
+    voidReason: z.string().optional(),
+  })
+  .or(z.any().transform(() => ({ voidReason: undefined })));
+
+export type TVoidDocumentMutationSchema = z.infer<typeof ZVoidDocumentMutationSchema>;
 
 export const ZSuccessfulDocumentResponseSchema = z.object({
   id: z.number(),
@@ -55,6 +64,7 @@ export const ZSuccessfulDocumentResponseSchema = z.object({
   createdAt: z.date(),
   updatedAt: z.date(),
   completedAt: z.date().nullable(),
+  recipients: z.lazy(() => z.array(ZSuccessfulRecipientResponseSchema)).optional(),
 });
 
 export const ZSuccessfulGetDocumentResponseSchema = ZSuccessfulDocumentResponseSchema.extend({
@@ -134,6 +144,10 @@ export type TUploadDocumentSuccessfulSchema = z.infer<typeof ZUploadDocumentSucc
 export const ZCreateDocumentMutationSchema = z.object({
   title: z.string().min(1),
   externalId: z.string().nullish(),
+  file: z
+    .string()
+    .describe('Base64-encoded PDF bytes. Compatibility path for JSON document creation without a presigned upload.')
+    .optional(),
   folderId: z
     .string()
     .describe(
@@ -176,6 +190,13 @@ export const ZCreateDocumentMutationSchema = z.object({
     .partial()
     .optional()
     .default({}),
+  emailSettings: z
+    .object({
+      senderName: z.string().optional(),
+      emailSubject: z.string().optional(),
+      emailMessage: z.string().optional(),
+    })
+    .optional(),
   authOptions: z
     .object({
       globalAccessAuth: z
@@ -207,23 +228,26 @@ export const ZCreateDocumentMutationSchema = z.object({
 
 export type TCreateDocumentMutationSchema = z.infer<typeof ZCreateDocumentMutationSchema>;
 
-export const ZCreateDocumentMutationResponseSchema = z.object({
-  uploadUrl: z.string().min(1),
-  documentId: z.number(),
-  externalId: z.string().nullish(),
-  recipients: z.array(
-    z.object({
-      recipientId: z.number(),
-      name: z.string(),
-      email: zEmail().min(1),
-      token: z.string(),
-      role: z.nativeEnum(RecipientRole),
-      signingOrder: z.number().nullish(),
+export const ZCreateDocumentMutationResponseSchema = z
+  .object({
+    uploadUrl: z.string().min(1),
+    documentId: z.number(),
+    externalId: z.string().nullish(),
+    recipients: z.array(
+      z.object({
+        recipientId: z.number(),
+        name: z.string(),
+        email: zEmail().min(1),
+        token: z.string(),
+        signingToken: z.string(),
+        role: z.nativeEnum(RecipientRole),
+        signingOrder: z.number().nullish(),
 
-      signingUrl: z.string(),
-    }),
-  ),
-});
+        signingUrl: z.string(),
+      }),
+    ),
+  })
+  .or(ZSuccessfulGetDocumentResponseSchema.omit({ fields: true }));
 
 export type TCreateDocumentMutationResponseSchema = z.infer<typeof ZCreateDocumentMutationResponseSchema>;
 
@@ -427,11 +451,12 @@ export const ZSuccessfulRecipientResponseSchema = z.object({
   role: z.nativeEnum(RecipientRole),
   signingOrder: z.number().nullish(),
   token: z.string(),
+  signingToken: z.string().optional(),
   expiresAt: z.date().nullish(),
   expirationNotifiedAt: z.date().nullish(),
   signedAt: z.date().nullable(),
   readStatus: z.nativeEnum(ReadStatus),
-  signingStatus: z.nativeEnum(SigningStatus),
+  signingStatus: z.union([z.nativeEnum(SigningStatus), z.literal('DECLINED')]),
   sendStatus: z.nativeEnum(SendStatus),
 
   signingUrl: z.string(),

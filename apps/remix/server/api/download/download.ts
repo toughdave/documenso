@@ -1,6 +1,10 @@
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import { AppError, AppErrorCode } from '@documenso/lib/errors/app-error';
 import { getEnvelopeById } from '@documenso/lib/server-only/envelope/get-envelope-by-id';
 import { getApiTokenByToken } from '@documenso/lib/server-only/public-api/get-api-token-by-token';
+import { isDocumentCompleted } from '@documenso/lib/utils/document';
+import { env } from '@documenso/lib/utils/env';
+import { unsafeBuildEnvelopeIdQuery } from '@documenso/lib/utils/envelope';
 import { buildTeamWhereQuery } from '@documenso/lib/utils/teams';
 import { prisma } from '@documenso/prisma';
 import { sValidator } from '@hono/standard-validator';
@@ -14,6 +18,34 @@ import {
   ZDownloadEnvelopeItemRequestParamsSchema,
   ZDownloadEnvelopeItemRequestQuerySchema,
 } from './download.types';
+
+type AnchorDownloadVersion = 'original' | 'signed';
+
+const getAnchorDownloadTokenSecret = () =>
+  env('NEXTAUTH_SECRET') ||
+  env('NEXT_PRIVATE_ENCRYPTION_KEY') ||
+  env('NEXT_PRIVATE_ENCRYPTION_SECONDARY_KEY') ||
+  'documenso-anchor-download-dev-secret';
+
+const signAnchorDownloadToken = (documentId: number, version: AnchorDownloadVersion, expiresAt: number) =>
+  createHmac('sha256', getAnchorDownloadTokenSecret())
+    .update(`anchor-download:${documentId}:${version}:${expiresAt}`)
+    .digest('hex');
+
+const verifyAnchorDownloadToken = (documentId: number, version: AnchorDownloadVersion, token: string) => {
+  const [expiresAtRaw, signature] = token.split('.');
+  const expiresAt = Number(expiresAtRaw);
+
+  if (!Number.isFinite(expiresAt) || Date.now() > expiresAt || !signature) {
+    return false;
+  }
+
+  const expected = signAnchorDownloadToken(documentId, version, expiresAt);
+  const signatureBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+
+  return signatureBuffer.length === expectedBuffer.length && timingSafeEqual(signatureBuffer, expectedBuffer);
+};
 
 export const downloadRoute = new Hono<HonoEnv>()
   /**
@@ -125,6 +157,73 @@ export const downloadRoute = new Hono<HonoEnv>()
       }
     },
   )
+  /**
+   * Short-lived, signed download URL used by the deprecated V1 JSON download
+   * endpoint. This lets API clients fetch completed PDFs without exposing their
+   * API token in a query string and works for database and S3 storage.
+   */
+  .get('/document/:documentId/download-url/:version/:token', async (c) => {
+    const logger = c.get('logger');
+
+    try {
+      const documentId = Number(c.req.param('documentId'));
+      const version = c.req.param('version');
+      const token = c.req.param('token');
+
+      if (!Number.isFinite(documentId) || (version !== 'original' && version !== 'signed')) {
+        return c.json({ error: 'Invalid download URL' }, 400);
+      }
+
+      if (!verifyAnchorDownloadToken(documentId, version, token)) {
+        return c.json({ error: 'Invalid download token' }, 401);
+      }
+
+      const envelope = await prisma.envelope.findFirst({
+        where: unsafeBuildEnvelopeIdQuery({ type: 'documentId', id: documentId }, EnvelopeType.DOCUMENT),
+        include: {
+          envelopeItems: {
+            include: {
+              documentData: true,
+            },
+            orderBy: {
+              order: 'asc',
+            },
+          },
+        },
+      });
+
+      const envelopeItem = envelope?.envelopeItems[0];
+
+      if (!envelope || !envelopeItem?.documentData) {
+        return c.json({ error: 'Document not found' }, 404);
+      }
+
+      if (version === 'signed' && !isDocumentCompleted(envelope.status)) {
+        return c.json({ error: 'Document is not completed yet.' }, 400);
+      }
+
+      logger.info({
+        auth: 'signed-url',
+        source: 'apiV1Compatibility',
+        path: c.req.path,
+        documentId,
+        version,
+      });
+
+      return await handleEnvelopeItemFileRequest({
+        title: envelopeItem.title,
+        status: envelope.status,
+        documentData: envelopeItem.documentData,
+        version,
+        isDownload: true,
+        context: c,
+      });
+    } catch (error) {
+      logger.error(error);
+
+      return c.json({ error: 'Internal server error' }, 500);
+    }
+  })
   /**
    * Download a document by its ID.
    * Requires API key authentication via Authorization header.

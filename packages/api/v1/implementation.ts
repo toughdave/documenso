@@ -1,7 +1,15 @@
+import { createHmac } from 'node:crypto';
 import { getServerLimits } from '@documenso/ee/server-only/limits/server';
 import { NEXT_PUBLIC_WEBAPP_URL } from '@documenso/lib/constants/app';
 import { DATE_FORMATS, DEFAULT_DOCUMENT_DATE_FORMAT } from '@documenso/lib/constants/date-formats';
-import { DocumentDataType, EnvelopeType, SigningStatus } from '@prisma/client';
+import {
+  DocumentDataType,
+  EnvelopeType,
+  type ReadStatus,
+  type RecipientRole,
+  type SendStatus,
+  SigningStatus,
+} from '@prisma/client';
 import { tsr } from '@ts-rest/serverless/fetch';
 import { match } from 'ts-pattern';
 import '@documenso/lib/constants/time-zones';
@@ -38,7 +46,7 @@ import {
 } from '@documenso/lib/types/field-meta';
 import { getFileServerSide } from '@documenso/lib/universal/upload/get-file.server';
 import { putNormalizedPdfFileServerSide } from '@documenso/lib/universal/upload/put-file.server';
-import { getPresignGetUrl, getPresignPostUrl } from '@documenso/lib/universal/upload/server-actions';
+import { getPresignPostUrl } from '@documenso/lib/universal/upload/server-actions';
 import { isDocumentCompleted } from '@documenso/lib/utils/document';
 import { createDocumentAuditLogData } from '@documenso/lib/utils/document-audit-logs';
 import { mapSecondaryIdToDocumentId, mapSecondaryIdToTemplateId } from '@documenso/lib/utils/envelope';
@@ -46,6 +54,118 @@ import { prisma } from '@documenso/prisma';
 
 import { ApiContractV1 } from './contract';
 import { authenticatedMiddleware } from './middleware/authenticated';
+
+const ANCHOR_DOWNLOAD_TOKEN_TTL_MS = 10 * 60 * 1000;
+
+type V1RecipientLike = {
+  id: number;
+  email: string;
+  name: string;
+  role: RecipientRole;
+  signingOrder: number | null;
+  token: string;
+  expiresAt: Date | null;
+  expirationNotifiedAt: Date | null;
+  signedAt: Date | null;
+  readStatus: ReadStatus;
+  signingStatus: SigningStatus;
+  sendStatus: SendStatus;
+};
+
+type V1DocumentLike = {
+  secondaryId: string;
+  externalId: string | null;
+  userId: number;
+  teamId: number | null;
+  folderId: string | null;
+  title: string;
+  status: string;
+  createdAt: Date;
+  updatedAt: Date;
+  completedAt: Date | null;
+  recipients: V1RecipientLike[];
+};
+
+const getAnchorDownloadTokenSecret = () =>
+  process.env.NEXTAUTH_SECRET ||
+  process.env.NEXT_PRIVATE_ENCRYPTION_KEY ||
+  process.env.NEXT_PRIVATE_ENCRYPTION_SECONDARY_KEY ||
+  'documenso-anchor-download-dev-secret';
+
+const signAnchorDownloadToken = (documentId: number, version: 'original' | 'signed', expiresAt: number) =>
+  createHmac('sha256', getAnchorDownloadTokenSecret())
+    .update(`anchor-download:${documentId}:${version}:${expiresAt}`)
+    .digest('hex');
+
+const createAnchorDownloadUrl = (documentId: number, version: 'original' | 'signed') => {
+  const expiresAt = Date.now() + ANCHOR_DOWNLOAD_TOKEN_TTL_MS;
+  const signature = signAnchorDownloadToken(documentId, version, expiresAt);
+
+  return `${NEXT_PUBLIC_WEBAPP_URL()}/api/v2/document/${documentId}/download-url/${version}/${expiresAt}.${signature}`;
+};
+
+const normalizeBase64Pdf = (input: string) => {
+  const [, maybeDataUrlPayload] = input.match(/^data:application\/pdf;base64,(.+)$/i) ?? [];
+  const base64 = maybeDataUrlPayload ?? input;
+  const buffer = Buffer.from(base64, 'base64');
+
+  return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+};
+
+const mapDocumentStatusForV1 = (status: string) => (status === 'REJECTED' ? 'DECLINED' : status);
+
+const mapSigningStatusForV1 = (status: SigningStatus): SigningStatus | 'DECLINED' =>
+  status === 'REJECTED' ? 'DECLINED' : status;
+
+const mapDocumentStatusFilterFromV1 = (
+  status: string | undefined,
+): Parameters<typeof findDocuments>[0]['status'] | undefined => {
+  if (status === 'DECLINED') {
+    return 'REJECTED';
+  }
+
+  if (status === 'EXPIRED') {
+    return undefined;
+  }
+
+  return status as Parameters<typeof findDocuments>[0]['status'];
+};
+
+const mapRecipientForV1 = (recipient: V1RecipientLike, documentId: number) => ({
+  id: recipient.id,
+  documentId,
+  email: recipient.email,
+  name: recipient.name,
+  role: recipient.role,
+  signingOrder: recipient.signingOrder,
+  token: recipient.token,
+  signingToken: recipient.token,
+  expiresAt: recipient.expiresAt,
+  expirationNotifiedAt: recipient.expirationNotifiedAt,
+  signedAt: recipient.signedAt,
+  readStatus: recipient.readStatus,
+  signingStatus: mapSigningStatusForV1(recipient.signingStatus),
+  sendStatus: recipient.sendStatus,
+  signingUrl: `${NEXT_PUBLIC_WEBAPP_URL()}/sign/${recipient.token}`,
+});
+
+const mapDocumentForV1 = (document: V1DocumentLike) => {
+  const documentId = mapSecondaryIdToDocumentId(document.secondaryId);
+
+  return {
+    id: documentId,
+    externalId: document.externalId,
+    userId: document.userId,
+    teamId: document.teamId,
+    folderId: document.folderId,
+    title: document.title,
+    status: mapDocumentStatusForV1(document.status),
+    createdAt: document.createdAt,
+    updatedAt: document.updatedAt,
+    completedAt: document.completedAt,
+    recipients: document.recipients.map((recipient) => mapRecipientForV1(recipient, documentId)),
+  };
+};
 
 export const ApiContractV1Implementation = tsr.router(ApiContractV1, {
   getDocuments: authenticatedMiddleware(async (args, user, team) => {
@@ -58,23 +178,13 @@ export const ApiContractV1Implementation = tsr.router(ApiContractV1, {
       userId: user.id,
       teamId: team.id,
       folderId: args.query.folderId,
+      status: mapDocumentStatusFilterFromV1(args.query.status),
     });
 
     return {
       status: 200,
       body: {
-        documents: documents.map((document) => ({
-          id: mapSecondaryIdToDocumentId(document.secondaryId),
-          externalId: document.externalId,
-          userId: document.userId,
-          teamId: document.teamId,
-          folderId: document.folderId,
-          title: document.title,
-          status: document.status,
-          createdAt: document.createdAt,
-          updatedAt: document.updatedAt,
-          completedAt: document.completedAt,
-        })),
+        documents: documents.map((document) => mapDocumentForV1(document)),
         totalPages,
       },
     };
@@ -147,35 +257,10 @@ export const ApiContractV1Implementation = tsr.router(ApiContractV1, {
         };
       });
 
-      const legacyDocumentId = mapSecondaryIdToDocumentId(envelope.secondaryId);
-
       return {
         status: 200,
         body: {
-          id: legacyDocumentId,
-          externalId: envelope.externalId,
-          userId: envelope.userId,
-          teamId: envelope.teamId,
-          folderId: envelope.folderId,
-          title: envelope.title,
-          status: envelope.status,
-          createdAt: envelope.createdAt,
-          updatedAt: envelope.updatedAt,
-          completedAt: envelope.completedAt,
-          recipients: recipients.map((recipient) => ({
-            id: recipient.id,
-            documentId: legacyDocumentId,
-            email: recipient.email,
-            name: recipient.name,
-            role: recipient.role,
-            signingOrder: recipient.signingOrder,
-            token: recipient.token,
-            signedAt: recipient.signedAt,
-            readStatus: recipient.readStatus,
-            signingStatus: recipient.signingStatus,
-            sendStatus: recipient.sendStatus,
-            signingUrl: `${NEXT_PUBLIC_WEBAPP_URL()}/sign/${recipient.token}`,
-          })),
+          ...mapDocumentForV1({ ...envelope, recipients }),
           fields: parsedMetaFields,
         },
       };
@@ -221,25 +306,6 @@ export const ApiContractV1Implementation = tsr.router(ApiContractV1, {
         };
       }
 
-      // This error is done AFTER the get envelope so we can test access controls without S3.
-      if (process.env.NEXT_PUBLIC_UPLOAD_TRANSPORT !== 's3') {
-        return {
-          status: 500,
-          body: {
-            message: 'Document downloads are only available when S3 storage is configured.',
-          },
-        };
-      }
-
-      if (DocumentDataType.S3_PATH !== firstDocumentData.type) {
-        return {
-          status: 400,
-          body: {
-            message: 'Invalid document data type',
-          },
-        };
-      }
-
       if (!downloadOriginalDocument && !isDocumentCompleted(envelope.status)) {
         return {
           status: 400,
@@ -258,13 +324,11 @@ export const ApiContractV1Implementation = tsr.router(ApiContractV1, {
         };
       }
 
-      const { url } = await getPresignGetUrl(
-        downloadOriginalDocument ? firstDocumentData.initialData : firstDocumentData.data,
-      );
+      const version = downloadOriginalDocument ? 'original' : 'signed';
 
       return {
         status: 200,
-        body: { downloadUrl: url },
+        body: { downloadUrl: createAnchorDownloadUrl(Number(documentId), version) },
       };
     } catch (err) {
       return {
@@ -324,11 +388,13 @@ export const ApiContractV1Implementation = tsr.router(ApiContractV1, {
           externalId: deletedDocument.externalId,
           userId: deletedDocument.userId,
           teamId: deletedDocument.teamId,
+          folderId: deletedDocument.folderId,
           title: deletedDocument.title,
-          status: deletedDocument.status,
+          status: mapDocumentStatusForV1(deletedDocument.status),
           createdAt: deletedDocument.createdAt,
           updatedAt: deletedDocument.updatedAt,
           completedAt: deletedDocument.completedAt,
+          recipients: deletedDocument.recipients.map((recipient) => mapRecipientForV1(recipient, legacyDocumentId)),
         },
       };
     } catch (err) {
@@ -341,10 +407,194 @@ export const ApiContractV1Implementation = tsr.router(ApiContractV1, {
     }
   }),
 
+  voidDocument: authenticatedMiddleware(async (args, user, team, { logger, metadata }) => {
+    const { id: documentId } = args.params;
+
+    logger.info({
+      input: {
+        id: documentId,
+      },
+    });
+
+    try {
+      const legacyDocumentId = Number(documentId);
+
+      const envelope = await getEnvelopeById({
+        id: {
+          type: 'documentId',
+          id: legacyDocumentId,
+        },
+        type: EnvelopeType.DOCUMENT,
+        userId: user.id,
+        teamId: team.id,
+      });
+
+      if (isDocumentCompleted(envelope.status)) {
+        return {
+          status: 400,
+          body: {
+            message: 'Completed documents cannot be voided.',
+          },
+        };
+      }
+
+      const voidedDocument = await deleteDocument({
+        id: {
+          type: 'documentId',
+          id: legacyDocumentId,
+        },
+        userId: user.id,
+        teamId: team.id,
+        requestMetadata: metadata,
+      });
+
+      return {
+        status: 200,
+        body: {
+          id: legacyDocumentId,
+          externalId: voidedDocument.externalId,
+          userId: voidedDocument.userId,
+          teamId: voidedDocument.teamId,
+          folderId: voidedDocument.folderId,
+          title: voidedDocument.title,
+          status: mapDocumentStatusForV1(voidedDocument.status),
+          createdAt: voidedDocument.createdAt,
+          updatedAt: voidedDocument.updatedAt,
+          completedAt: voidedDocument.completedAt,
+          recipients: voidedDocument.recipients.map((recipient) => mapRecipientForV1(recipient, legacyDocumentId)),
+        },
+      };
+    } catch (err) {
+      return {
+        status: 500,
+        body: {
+          message: err instanceof Error ? err.message : 'Unable to void document',
+        },
+      };
+    }
+  }),
+
   createDocument: authenticatedMiddleware(async (args, user, team, { metadata }) => {
     const { body } = args;
 
     try {
+      if (body.file) {
+        const base64File = body.file;
+        const dateFormat = body.meta.dateFormat
+          ? DATE_FORMATS.find((format) => format.value === body.meta.dateFormat)
+          : DATE_FORMATS.find((format) => format.value === DEFAULT_DOCUMENT_DATE_FORMAT);
+
+        if (body.meta.dateFormat && !dateFormat) {
+          return {
+            status: 400,
+            body: {
+              message: 'Invalid date format. Please provide a valid date format',
+            },
+          };
+        }
+
+        const timezone = body.meta.timezone
+          ? TIME_ZONES.find((tz) => tz === body.meta.timezone)
+          : DEFAULT_DOCUMENT_TIME_ZONE;
+
+        const isTimeZoneValid = body.meta.timezone ? TIME_ZONES.includes(String(timezone)) : true;
+
+        if (!isTimeZoneValid) {
+          return {
+            status: 400,
+            body: {
+              message: 'Invalid timezone. Please provide a valid timezone',
+            },
+          };
+        }
+
+        const { remaining } = await getServerLimits({ userId: user.id, teamId: team.id });
+
+        if (remaining.documents <= 0) {
+          return {
+            status: 400,
+            body: {
+              message: 'You have reached the maximum number of documents allowed for this month',
+            },
+          };
+        }
+
+        const fileName = body.title.endsWith('.pdf') ? body.title : `${body.title}.pdf`;
+        const documentData = await putNormalizedPdfFileServerSide({
+          name: fileName,
+          type: 'application/pdf',
+          arrayBuffer: async () => Promise.resolve(normalizeBase64Pdf(base64File)),
+        });
+
+        const envelope = await createEnvelope({
+          userId: user.id,
+          teamId: team.id,
+          internalVersion: 1,
+          data: {
+            title: body.title,
+            type: EnvelopeType.DOCUMENT,
+            externalId: body.externalId || undefined,
+            formValues: body.formValues,
+            folderId: body.folderId,
+            envelopeItems: [
+              {
+                documentDataId: documentData.id,
+              },
+            ],
+            globalAccessAuth: body.authOptions?.globalAccessAuth,
+            globalActionAuth: body.authOptions?.globalActionAuth,
+          },
+          attachments: body.attachments,
+          meta: {
+            subject: body.meta.subject ?? body.emailSettings?.emailSubject,
+            message: body.meta.message ?? body.emailSettings?.emailMessage,
+            timezone,
+            dateFormat: dateFormat?.value,
+            redirectUrl: body.meta.redirectUrl,
+            signingOrder: body.meta.signingOrder,
+            allowDictateNextSigner: body.meta.allowDictateNextSigner,
+            language: body.meta.language,
+            typedSignatureEnabled: body.meta.typedSignatureEnabled,
+            uploadSignatureEnabled: body.meta.uploadSignatureEnabled,
+            drawSignatureEnabled: body.meta.drawSignatureEnabled,
+            distributionMethod: body.meta.distributionMethod,
+            emailSettings: body.meta.emailSettings,
+          },
+          requestMetadata: metadata,
+        });
+
+        const legacyDocumentId = mapSecondaryIdToDocumentId(envelope.secondaryId);
+
+        await setDocumentRecipients({
+          userId: user.id,
+          teamId: team.id,
+          id: {
+            type: 'documentId',
+            id: legacyDocumentId,
+          },
+          recipients: body.recipients,
+          requestMetadata: metadata,
+        });
+
+        const createdDocument = await prisma.envelope.findFirstOrThrow({
+          where: {
+            id: envelope.id,
+          },
+          include: {
+            recipients: {
+              orderBy: {
+                id: 'asc',
+              },
+            },
+          },
+        });
+
+        return {
+          status: 200,
+          body: mapDocumentForV1(createdDocument),
+        };
+      }
+
       if (process.env.NEXT_PUBLIC_UPLOAD_TRANSPORT !== 's3') {
         return {
           status: 500,
@@ -462,6 +712,7 @@ export const ApiContractV1Implementation = tsr.router(ApiContractV1, {
             name: recipient.name,
             email: recipient.email,
             token: recipient.token,
+            signingToken: recipient.token,
             role: recipient.role,
             signingOrder: recipient.signingOrder,
             signingUrl: `${NEXT_PUBLIC_WEBAPP_URL()}/sign/${recipient.token}`,
@@ -1009,23 +1260,23 @@ export const ApiContractV1Implementation = tsr.router(ApiContractV1, {
         requestMetadata: metadata,
       });
 
+      const sentDocumentId = mapSecondaryIdToDocumentId(sentDocument.secondaryId);
+
       return {
         status: 200,
         body: {
           message: 'Document sent for signing successfully',
-          id: mapSecondaryIdToDocumentId(sentDocument.secondaryId),
+          id: sentDocumentId,
           externalId: sentDocument.externalId,
           userId: sentDocument.userId,
           teamId: sentDocument.teamId,
+          folderId: sentDocument.folderId,
           title: sentDocument.title,
-          status: sentDocument.status,
+          status: mapDocumentStatusForV1(sentDocument.status),
           createdAt: sentDocument.createdAt,
           updatedAt: sentDocument.updatedAt,
           completedAt: sentDocument.completedAt,
-          recipients: recipients.map((recipient) => ({
-            ...recipient,
-            signingUrl: `${NEXT_PUBLIC_WEBAPP_URL()}/sign/${recipient.token}`,
-          })),
+          recipients: recipients.map((recipient) => mapRecipientForV1(recipient, sentDocumentId)),
         },
       };
     } catch (err) {
