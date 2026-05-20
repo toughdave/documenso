@@ -40,7 +40,8 @@
     "make:version": "npm version --workspace @documenso/remix --include-workspace-root --no-git-tag-version -m \"v%s\"",
     "translate": "npm run translate:extract && npm run translate:compile",
     "translate:extract": "lingui extract --clean",
-    "translate:compile": "lingui compile"
+    "translate:compile": "lingui compile",
+    "anchor:configure-integration": "npm run with:env -- tsx scripts/anchor/configure-anchor-integration.ts"
   },
   "packageManager": "npm@11.11.0",
   "engines": {

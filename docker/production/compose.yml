@@ -16,12 +16,16 @@ services:
       - database:/var/lib/postgresql/data
 
   documenso:
-    image: documenso/documenso:latest
+    image: ${DOCUMENSO_IMAGE:-toughdave/documenso-anchor:latest}
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
     depends_on:
       database:
         condition: service_healthy
     environment:
       - PORT=${PORT:-3000}
+      - NEXTAUTH_URL=${NEXTAUTH_URL:?err}
       - NEXTAUTH_SECRET=${NEXTAUTH_SECRET:?err}
       - NEXT_PRIVATE_ENCRYPTION_KEY=${NEXT_PRIVATE_ENCRYPTION_KEY:?err}
       - NEXT_PRIVATE_ENCRYPTION_SECONDARY_KEY=${NEXT_PRIVATE_ENCRYPTION_SECONDARY_KEY:?err}
@@ -64,9 +68,11 @@ services:
       - NEXT_PUBLIC_DISABLE_MICROSOFT_SIGNUP=${NEXT_PUBLIC_DISABLE_MICROSOFT_SIGNUP}
       - NEXT_PUBLIC_DISABLE_OIDC_SIGNUP=${NEXT_PUBLIC_DISABLE_OIDC_SIGNUP}
       - NEXT_PRIVATE_ALLOWED_SIGNUP_DOMAINS=${NEXT_PRIVATE_ALLOWED_SIGNUP_DOMAINS}
+      - NEXT_PRIVATE_SIGNING_TRANSPORT=${NEXT_PRIVATE_SIGNING_TRANSPORT:-local}
       - NEXT_PRIVATE_SIGNING_LOCAL_FILE_PATH=${NEXT_PRIVATE_SIGNING_LOCAL_FILE_PATH:-/opt/documenso/cert.p12}
       - NEXT_PRIVATE_SIGNING_PASSPHRASE=${NEXT_PRIVATE_SIGNING_PASSPHRASE}
       - NEXT_PUBLIC_USE_INTERNAL_URL_BROWSERLESS=${NEXT_PUBLIC_USE_INTERNAL_URL_BROWSERLESS}
+      - DOCUMENSO_DISABLE_TELEMETRY=${DOCUMENSO_DISABLE_TELEMETRY}
     ports:
       - ${PORT:-3000}:${PORT:-3000}
     volumes:
